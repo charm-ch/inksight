@@ -996,7 +996,7 @@ function ConfigPageInner() {
     } finally {
       setFocusToggleLoading(false);
     }
-  }, [authHeaders, isFocusListening, mac, showToast]);
+  }, [isFocusListening, mac, showToast]);
 
   const buildPreviewParams = useCallback((mode?: string, forceNoCache = false, forcedModeOverride?: ModeOverride) => {
     const m = mode || previewMode;
