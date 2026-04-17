@@ -220,6 +220,232 @@ void showDiagnostic(const char *line1, const char *line2, const char *line3, con
     epdDisplay(imgBuf);
 }
 
+// ── AI chat drawing helpers ───────────────────────────────────
+
+static bool isAsciiOnly(const char *s) {
+    if (!s) return false;
+    for (const unsigned char *p = (const unsigned char*)s; *p; ++p) {
+        if (*p >= 128) return false;
+    }
+    return true;
+}
+
+static const char *aiStatusTitle(const char *state) {
+    if (!state) return "AI";
+    if (strcmp(state, "IDLE") == 0) return "AI IDLE";
+    if (strcmp(state, "CONNECTING") == 0) return "CONNECT";
+    if (strcmp(state, "LISTENING") == 0) return "LISTEN";
+    if (strcmp(state, "THINKING") == 0) return "THINK";
+    if (strcmp(state, "SPEAKING") == 0) return "SPEAK";
+    // Fallback: keep it short (must be ASCII to display well)
+    return "AI";
+}
+
+static const char *aiStatusDetailFallback(const char *state) {
+    // Keep details short for 4.2" screens.
+    if (!state) return "NON-ASCII";
+    if (strcmp(state, "ERROR") == 0) return "ERROR";
+    if (strcmp(state, "IDLE") == 0) return "WAITING";
+    if (strcmp(state, "CONNECTING") == 0) return "WS CONNECT";
+    if (strcmp(state, "LISTENING") == 0) return "MIC LISTEN";
+    if (strcmp(state, "THINKING") == 0) return "WORKING";
+    if (strcmp(state, "SPEAKING") == 0) return "PLAYING";
+    return "NON-ASCII";
+}
+
+static void drawHLine(int x0, int x1, int y) {
+    if (x1 <= x0) return;
+    // draw black pixels
+    fillRect(x0, y, x1 - x0, 1);
+}
+
+static void clearRectToWhite(int x, int y, int w, int h) {
+    int rowBytes = W / 8;
+    for (int py = y; py < y + h; ++py) {
+        if (py < 0 || py >= H) continue;
+        for (int px = x; px < x + w; ++px) {
+            if (px < 0 || px >= W) continue;
+            imgBuf[py * rowBytes + px / 8] |= (0x80 >> (px % 8));
+        }
+    }
+}
+
+static void drawWrappedAsciiText(const char *msg, int x, int y, int width, int scale, int maxLines) {
+    if (!msg || !msg[0] || width <= 0 || scale <= 0 || maxLines <= 0) return;
+
+    const int charW = 5 * scale + scale;
+    int maxChars = width / charW;
+    if (maxChars < 1) maxChars = 1;
+
+    const int lineHeight = 7 * scale + scale * 2;
+    char lineBuf[96];
+
+    int lineNo = 0;
+    int lineLen = 0;
+
+    for (const char *p = msg; *p && lineNo < maxLines; ++p) {
+        char ch = *p;
+        if (ch == '\n' || ch == '\r') {
+            if (lineLen > 0) {
+                lineBuf[lineLen] = '\0';
+                drawText(lineBuf, x, y + lineNo * lineHeight, scale);
+                lineNo++;
+                lineLen = 0;
+            }
+            continue;
+        }
+
+        lineBuf[lineLen++] = ch;
+        if (lineLen >= maxChars) {
+            lineBuf[lineLen] = '\0';
+            drawText(lineBuf, x, y + lineNo * lineHeight, scale);
+            lineNo++;
+            lineLen = 0;
+        }
+    }
+
+    if (lineLen > 0 && lineNo < maxLines) {
+        lineBuf[lineLen] = '\0';
+        drawText(lineBuf, x, y + lineNo * lineHeight, scale);
+    }
+}
+
+// Conversation body region (used for partial refresh)
+static int aiChatBodyLeft() { return W * 7 / 100; }
+static int aiChatBodyRight() { return W - (W * 7 / 100); }
+
+// Compute how many wrapped lines can be safely drawn in [startY, endY)
+// without any pixel going outside the region.
+static int computeMaxWrappedLines(int startY, int endY, int scale) {
+    if (endY <= startY) return 0;
+    const int textHeight = 7 * scale;                 // drawText() pixel height
+    const int lineHeight = 7 * scale + scale * 2;    // same as drawWrappedAsciiText()
+    int availableForFirstLine = (endY - startY) - textHeight;
+    if (availableForFirstLine < 0) return 0;
+    // N lines: last line index is (N-1)
+    // startY + (N-1)*lineHeight + textHeight <= endY
+    return availableForFirstLine / lineHeight + 1;
+}
+
+static int aiChatBodyTop() {
+    // IMPORTANT: align with backend `backend/core/voice_service.py`:
+    // _render_reply_bmp() uses fixed `body_top = 56` and draws "YOU" at y=56.
+    // If partial refresh starts below this line, the "YOU" label won't update.
+    const int body_top = 56;
+    if (body_top < 0) return 0;
+    if (body_top >= H) return H - 1;
+    return body_top;
+}
+
+static int aiChatBodyBottom() { return H - ((H < 200) ? 10 : 8); }
+
+static int aiChatBodyPartialLeft() {
+    int left = aiChatBodyLeft();
+    return (left / 8) * 8;
+}
+
+static int aiChatBodyPartialRight() {
+    int right = aiChatBodyRight();
+    int aligned = ((right + 7) / 8) * 8;
+    if (aligned > W) aligned = W;
+    return aligned;
+}
+
+static uint8_t aiChatPartialBuf[IMG_BUF_LEN];
+
+static void clearAiChatBodyArea() {
+    // Must match refreshAiChatConversationBody() rectangle to avoid
+    // stale pixels outside the cleared area.
+    int x = 0;
+    int y = aiChatBodyTop();
+    int w = W;
+    int h = H - aiChatBodyTop();
+    if (w <= 0 || h <= 0) return;
+    clearRectToWhite(x, y, w, h);
+}
+
+void showAiChatStatus(const char *state, const char *detail) {
+    memset(imgBuf, 0xFF, IMG_BUF_LEN);
+
+    int titleScale = (H < 200) ? 2 : 4;
+    int bodyScale = (H < 200) ? 1 : 2;
+    int marginX = W * 7 / 100;
+    int contentWidth = W - marginX * 2;
+    if (contentWidth < 40) contentWidth = W - 8;
+
+    const char *title = aiStatusTitle(state);
+    const char *body = detail;
+    if (!body || !body[0] || !isAsciiOnly(body)) {
+        body = aiStatusDetailFallback(state);
+    }
+
+    int titleWidth = textWidth(strlen(title), titleScale);
+    int titleX = (W - titleWidth) / 2;
+    if (titleX < marginX) titleX = marginX;
+    int titleY = H * 12 / 100;
+
+    drawText(title, titleX, titleY, titleScale);
+
+    int lineY = titleY + 7 * titleScale + titleScale * 3;
+    drawHLine(marginX, W - marginX, lineY);
+    drawHLine(marginX, W - marginX, lineY + 3);
+
+    int bodyY = lineY + ((H < 200) ? 12 : 20);
+    int yEnd = aiChatBodyBottom(); // clamp to the same bottom edge as partial area
+    int maxLines = computeMaxWrappedLines(bodyY, yEnd, bodyScale);
+    drawWrappedAsciiText(body, marginX, bodyY, contentWidth, bodyScale, maxLines);
+
+    epdDisplayFast(imgBuf);
+}
+
+void updateAiChatConversationText(const char *label, const char *detail) {
+    clearAiChatBodyArea();
+
+    const char *title = (label && label[0]) ? label : "INFO";
+    const char *body = detail;
+    if (!body || !body[0] || !isAsciiOnly(body)) {
+        body = aiStatusDetailFallback(label);
+    }
+
+    int labelScale = (H < 200) ? 1 : 2;
+    int bodyScale = (H < 200) ? 1 : 2;
+    drawText(title, aiChatBodyLeft(), aiChatBodyTop(), labelScale);
+    int bodyY = aiChatBodyTop() + (7 * labelScale + labelScale * 2);
+    int bodyWidth = aiChatBodyRight() - aiChatBodyLeft();
+    int yEnd = aiChatBodyBottom();
+    int maxLines = computeMaxWrappedLines(bodyY, yEnd, bodyScale);
+    drawWrappedAsciiText(body, aiChatBodyLeft(), bodyY, bodyWidth, bodyScale, maxLines);
+    refreshAiChatConversationBody();
+}
+
+void refreshAiChatConversationBody() {
+    // Partial refresh is much faster than full-screen updates.
+    // We deliberately refresh a slightly larger vertical range (to screen bottom)
+    // to avoid stale pixels when backend layout shifts between turns.
+    int xStart = 0;
+    int xEnd = W;      // exclusive
+    int yStart = aiChatBodyTop();
+    int yEnd = H;      // exclusive
+
+    int xS = xStart / 8;
+    int xE = (xEnd - 1) / 8;
+    int widthBytes = xE - xS + 1;
+    int height = yEnd - yStart;
+
+    if (widthBytes <= 0 || height <= 0) return;
+
+    memset(aiChatPartialBuf, 0xFF, widthBytes * height);
+    for (int row = 0; row < height; ++row) {
+        memcpy(
+            aiChatPartialBuf + row * widthBytes,
+            imgBuf + (yStart + row) * ROW_BYTES + xS,
+            widthBytes
+        );
+    }
+
+    epdPartialDisplay(aiChatPartialBuf, xStart, yStart, xEnd, yEnd);
+}
+
 // ── Show centered error message ─────────────────────────────
 
 void showError(const char *msg) {
@@ -394,27 +620,18 @@ void showModePreview(const char *modeName) {
     Serial.printf("Mode preview shown: %s\n", modeName);
 }
 
+// ── Smart display with hybrid refresh strategy ──────────────
+// Uses fast refresh (0xC7 + temperature LUT, ~1.5s, minimal flash) most of the time.
+// Performs a full refresh (0xF7, clears ghosting) every FULL_REFRESH_INTERVAL cycles.
+
 static int refreshCount = 0;
 
 void smartDisplay(const uint8_t *image) {
-#if EPD_BPP >= 2
-    if (useColorBuf) {
-        Serial.printf("smartDisplay: 2bpp color (cycle %d)\n", refreshCount);
-        epdDisplay2bpp(colorBuf);
-        useColorBuf = false;
-        refreshCount++;
-        return;
-    }
-#endif
     if (refreshCount % FULL_REFRESH_INTERVAL == 0) {
         Serial.printf("smartDisplay: full refresh (cycle %d)\n", refreshCount);
         epdDisplay(image);
     } else {
-#if defined(EPD_PANEL_42_GXEPD2_GYE042A87)
-        Serial.printf("smartDisplay: full refresh fallback (cycle %d)\n", refreshCount);
-#else
         Serial.printf("smartDisplay: fast refresh (cycle %d)\n", refreshCount);
-#endif
         epdDisplayFast(image);
     }
     refreshCount++;

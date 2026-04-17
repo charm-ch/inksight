@@ -13,6 +13,7 @@
 #define PIN_BAT_ADC    0
 #define PIN_CFG_BTN    9
 #define PIN_LED        3
+#define PIN_AI_CHAT_SW -1
 #elif defined(BOARD_PROFILE_ESP32_WROOM32E)
 #define PIN_EPD_MOSI   14
 #define PIN_EPD_SCK    13
@@ -23,6 +24,7 @@
 #define PIN_BAT_ADC    35
 #define PIN_CFG_BTN    0
 #define PIN_LED        2
+#define PIN_AI_CHAT_SW 23
 #else
 #error "Unsupported board profile"
 #endif
@@ -48,17 +50,8 @@ static const int ROW_BYTES   = W / 8;
 static const int ROW_STRIDE  = (ROW_BYTES + 3) & ~3;  // BMP row stride (4-byte aligned)
 static const int IMG_BUF_LEN = ROW_BYTES * H;
 
-#ifndef EPD_BPP
-#define EPD_BPP 1
-#endif
-static const int COLOR_BUF_LEN = (W * H) / 4;  // 2bpp: 4 pixels per byte
-
-// Shared framebuffers (defined in main.cpp)
+// Shared framebuffer (defined in main.cpp)
 extern uint8_t imgBuf[];
-#if EPD_BPP >= 2
-extern uint8_t colorBuf[];
-extern bool useColorBuf;
-#endif
 
 // ── Refresh strategy ─────────────────────────────────────────
 static const int FULL_REFRESH_INTERVAL = 10;  // Full refresh every N updates to clear ghosting
@@ -68,6 +61,7 @@ static const char *DEFAULT_SERVER  = "";  // Must be set via captive portal
 static const int   WIFI_TIMEOUT    = 15000;   // ms
 static const int   HTTP_TIMEOUT    = 30000;   // ms
 static const int   CFG_BTN_HOLD_MS = 2000;    // Long press duration to trigger config mode
+static const int   AI_CHAT_BTN_HOLD_MS = 3000; // Long press duration to enter AI chat mode
 static const int   SHORT_PRESS_MIN_MS = 50;   // Minimum short press duration (debounce)
 static const int   LIVE_POLL_MS = 5000;       // Poll interval for pending remote actions
 static const int   LIVE_WIFI_RETRY_MS = 5000; // Retry interval when WiFi is disconnected
@@ -94,5 +88,9 @@ static const int DEBUG_REFRESH_MIN = 1;  // 1 minute for debugging
 
 #define TIME_TEXT_X   (W * 1 / 100)
 #define TIME_TEXT_Y   (H * 4 / 100)
+
+#ifndef AUTO_BOOT_AI_CHAT
+#define AUTO_BOOT_AI_CHAT 0
+#endif
 
 #endif // INKSIGHT_CONFIG_H

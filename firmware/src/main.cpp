@@ -2,34 +2,69 @@
 // https://github.com/datascale-ai/inksight
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <new>
 #include <WiFi.h>
 
 #include "config.h"
-#include "epd_driver.h"
-#include "display.h"
+#include "audio.h"
+#include "audio_codec.h"
+#include "audio_service.h"
 #include "network.h"
-#include "ota.h"
 #include "storage.h"
 #include "portal.h"
+
+#if !VOICE_ONLY_BUILD
+#include "epd_driver.h"
+#include "display.h"
 #include "offline_cache.h"
+#endif
 
 // ── Shared framebuffers (referenced by other modules via extern) ──
 uint8_t imgBuf[IMG_BUF_LEN];
-#if EPD_BPP >= 2
-uint8_t colorBuf[COLOR_BUF_LEN];
-bool useColorBuf = false;
+
+// ── Voice constants ─────────────────────────────────────────
+static const char *AI_CHAT_MODE_ID = "AI_CHAT";
+static const int VOICE_SILENCE_COMMIT_MS = 600;
+static const float VOICE_STREAM_VAD_THRESHOLD = 150.0f;
+static const unsigned long VOICE_MAX_CAPTURE_MS = 8000;
+
+#if VOICE_ONLY_BUILD
+static const float BARGE_IN_THRESHOLD = 2000.0f;
+static const int BARGE_IN_CONFIRM_FRAMES = 3;
 #endif
 
-// ── Device state machine ────────────────────────────────────
+struct VoiceTurnPerf {
+    int turnIndex = 0;
+    unsigned long speechStartAt = 0;
+    unsigned long firstChunkSentAt = 0;
+    unsigned long commitAt = 0;
+    unsigned long firstAsrPartialAt = 0;
+    unsigned long asrFinalAt = 0;
+    unsigned long firstLlmDeltaAt = 0;
+    unsigned long firstTtsChunkAt = 0;
+    unsigned long firstPlaybackAt = 0;
+    unsigned long turnDoneAt = 0;
+    size_t sentAudioChunks = 0;
+    size_t sentAudioBytes = 0;
+    size_t recvAudioChunks = 0;
+    size_t recvAudioBytes = 0;
+};
+
+// ── Device state machine (shared) ─────────────────────────────
+// This file is compiled for both VOICE_ONLY_BUILD and the display firmware,
+// so the enum must exist before any DeviceContext uses it.
 enum class DeviceState : uint8_t {
-    BOOT,           // Initial state, loading config
-    PORTAL,         // Captive portal active
-    CONNECTING,     // Connecting to WiFi
-    FETCHING,       // Downloading image from backend
-    DISPLAYING,     // Showing content, clock ticking
-    REFRESHING,     // Manual refresh triggered
-    SLEEPING,       // Deep sleep
-    ERROR,          // Error state, retry pending
+    BOOT,
+    PORTAL,
+    CONNECTING,
+    FETCHING,
+    DISPLAYING,
+    REFRESHING,
+    SLEEPING,
+    ERROR,
 };
 
 struct DeviceContext {
@@ -37,6 +72,7 @@ struct DeviceContext {
 
     // Button state
     unsigned long btnPressStart = 0;
+    unsigned long aiBtnPressStart = 0;
     bool ignoreConfigButtonUntilRelease = false;
     bool liveMode = false;
     unsigned long lastLivePollAt = 0;
@@ -49,11 +85,11 @@ struct DeviceContext {
     // Pending actions (set by button handler, consumed by loop)
     bool wantRefresh = false;
     bool wantEnterLiveMode = false;
+    bool wantEnterAiChatMode = false;
 };
 
 static DeviceContext ctx;
 static bool focusListening = false;
-static bool alwaysActive = false;
 
 // Content dedup — skip display refresh when content unchanged
 static uint32_t lastContentChecksum = 0;
@@ -81,7 +117,7 @@ static void ledInit() {
     digitalWrite(PIN_LED, LOW);
 }
 
-void ledFeedback(const char *pattern) {
+static void ledFeedback(const char *pattern) {
     if (strcmp(pattern, "ack") == 0) {
         for (int i = 0; i < 2; i++) {
             digitalWrite(PIN_LED, HIGH); delay(80);
@@ -114,6 +150,7 @@ void ledFeedback(const char *pattern) {
 }
 
 static void enterPortalMode() {
+    g_userAborted = false;
     String mac = WiFi.macAddress();
     String apName = "InkSight-" + mac.substring(mac.length() - 5);
     apName.replace(":", "");
@@ -127,14 +164,476 @@ static void enterPortalMode() {
     WiFi.mode(WIFI_OFF);
 
     ledFeedback("portal");
+    #if !VOICE_ONLY_BUILD
     showSetupScreen(apName.c_str());
+    #endif
     startCaptivePortal();
     ctx.state = DeviceState::PORTAL;
     ctx.ignoreConfigButtonUntilRelease = (digitalRead(PIN_CFG_BTN) == LOW);
 }
+// ── Shared voice helpers ────────────────────────────────────
+
+static unsigned long voicePerfSince(unsigned long startedAt) {
+    return startedAt > 0 ? millis() - startedAt : 0;
+}
+
+static void resetVoiceTurnPerf(VoiceTurnPerf &perf) {
+    perf = VoiceTurnPerf();
+}
+
+static bool checkAiChatShortPress() {
+    static unsigned long pressStart = 0;
+    bool isPressed = (digitalRead(PIN_CFG_BTN) == LOW);
+    if (isPressed) {
+        if (pressStart == 0) pressStart = millis();
+        return false;
+    }
+    if (pressStart == 0) return false;
+    unsigned long duration = millis() - pressStart;
+    pressStart = 0;
+    return duration >= (unsigned long)SHORT_PRESS_MIN_MS && duration < (unsigned long)CFG_BTN_HOLD_MS;
+}
+
+// ── AudioService send helper ────────────────────────────────
+
+static void drainSendQueue(AudioService &as) {
+    AsAudioPacket* pkt = nullptr;
+    while (as.PollSendPacket(pkt)) {
+        voiceWsSendRawPacket(pkt->data, pkt->dataLen);
+        as.ReleaseSendPacket(pkt);
+    }
+}
 
 // ═════════════════════════════════════════════════════════════
-// setup()
+#if VOICE_ONLY_BUILD
+// ═════════════════════════════════════════════════════════════
+//
+// Voice-only firmware: ESP32 + INMP441 + MAX98357A, no display.
+// Full-duplex audio on two I2S peripherals.
+// State machine inspired by xiaozhi-esp32.
+//
+// ═════════════════════════════════════════════════════════════
+
+enum class VoiceState : uint8_t {
+    IDLE,
+    CONNECTING,
+    LISTENING,
+    THINKING,
+    SPEAKING,
+};
+
+static const char *voiceStateName(VoiceState s) {
+    switch (s) {
+        case VoiceState::IDLE:       return "IDLE";
+        case VoiceState::CONNECTING: return "CONNECTING";
+        case VoiceState::LISTENING:  return "LISTENING";
+        case VoiceState::THINKING:   return "THINKING";
+        case VoiceState::SPEAKING:   return "SPEAKING";
+        default:                     return "?";
+    }
+}
+
+static bool gPortalMode = false;
+
+static void voiceSetLed(VoiceState state) {
+    switch (state) {
+        case VoiceState::IDLE:       digitalWrite(PIN_LED, LOW); break;
+        case VoiceState::CONNECTING: digitalWrite(PIN_LED, HIGH); break;
+        case VoiceState::LISTENING:  digitalWrite(PIN_LED, HIGH); break;
+        case VoiceState::THINKING:   digitalWrite(PIN_LED, LOW); break;
+        case VoiceState::SPEAKING:   digitalWrite(PIN_LED, LOW); break;
+    }
+}
+
+static void runVoiceLoop(AudioService &audioService) {
+    audioService.Start();
+    Serial.println("[VOICE] AudioService started");
+
+    while (true) {
+        VoiceState state = VoiceState::CONNECTING;
+        voiceSetLed(state);
+        Serial.println("[VOICE] Connecting WebSocket...");
+
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[VOICE] WiFi disconnected, reconnecting...");
+            ledFeedback("connecting");
+            if (!connectWiFi()) {
+                Serial.println("[VOICE] WiFi failed, retry in 5s");
+                ledFeedback("fail");
+                delay(5000);
+                continue;
+            }
+        }
+
+        if (!voiceWsOpen(SAMPLE_RATE, W, H, false)) {
+            Serial.println("[VOICE] WebSocket open failed, retry in 3s");
+            ledFeedback("fail");
+            delay(3000);
+            continue;
+        }
+
+        bool sessionReady = false;
+        unsigned long readyStartAt = millis();
+        while (!sessionReady && millis() - readyStartAt < 6000UL) {
+            voiceWsLoop();
+            VoiceWsEvent ev;
+            while (voiceWsPollEvent(ev)) {
+                if (ev.type == VoiceWsEventType::SessionReady) sessionReady = true;
+                voiceWsReleaseEvent(ev);
+            }
+            delay(10);
+        }
+        if (!sessionReady) {
+            Serial.println("[VOICE] Session ready timeout, retry in 3s");
+            voiceWsClose();
+            ledFeedback("fail");
+            delay(3000);
+            continue;
+        }
+
+        state = VoiceState::LISTENING;
+        voiceSetLed(state);
+        Serial.println("[VOICE] Session ready, LISTENING");
+
+        bool speechDetected = false;
+        unsigned long lastVoiceAt = 0;
+        int turnCounter = 0;
+        int bargeInFrames = 0;
+        VoiceTurnPerf turnPerf;
+        unsigned long lastRmsLogAt = 0;
+        float peakRms = 0;
+
+        audioService.FlushCaptureQueue();
+
+        while (voiceWsConnected()) {
+            voiceWsLoop();
+            drainSendQueue(audioService);
+
+            AsCaptureChunk *cap = nullptr;
+            while (audioService.PollCaptureChunk(cap)) {
+                if (state == VoiceState::LISTENING && cap->sampleCount > 0) {
+                    audioNoiseGateApply(cap->samples, cap->sampleCount, 80.0f);
+                    float rms = audioCalculateRMS(cap->samples, cap->sampleCount);
+                    if (!speechDetected && rms < VOICE_STREAM_VAD_THRESHOLD) {
+                        audioAdaptiveNoiseFloor(rms);
+                    }
+                    float noiseFloor = audioAdaptiveNoiseFloor(-1.0f);
+                    float effectiveThreshold = max(VOICE_STREAM_VAD_THRESHOLD, noiseFloor * 3.0f);
+
+                    if (rms > peakRms) peakRms = rms;
+                    if (millis() - lastRmsLogAt >= 2000) {
+                        Serial.printf("[VOICE] MIC peak RMS=%.0f (threshold=%.0f, noise=%.0f)\n", peakRms, effectiveThreshold, noiseFloor);
+                        peakRms = 0;
+                        lastRmsLogAt = millis();
+                    }
+
+                    if (rms >= effectiveThreshold) {
+                        if (!speechDetected) {
+                            turnCounter++;
+                            resetVoiceTurnPerf(turnPerf);
+                            turnPerf.turnIndex = turnCounter;
+                            turnPerf.speechStartAt = millis();
+                            Serial.printf("[VOICE] Turn %d: speech start (RMS=%.0f)\n", turnCounter, rms);
+                        }
+                        speechDetected = true;
+                        lastVoiceAt = millis();
+                    }
+
+                    if (speechDetected) {
+                        audioService.PushForEncoding(cap->samples, cap->sampleCount);
+                        turnPerf.sentAudioChunks++;
+                        turnPerf.sentAudioBytes += cap->sampleCount * sizeof(int16_t);
+                        if (turnPerf.firstChunkSentAt == 0) turnPerf.firstChunkSentAt = millis();
+
+                        bool silenceTimeout = !voiceWsServerVad() && (millis() - lastVoiceAt >= (unsigned long)VOICE_SILENCE_COMMIT_MS);
+                        bool maxDuration = (millis() - turnPerf.speechStartAt >= VOICE_MAX_CAPTURE_MS);
+
+                        if (silenceTimeout || maxDuration) {
+                            speechDetected = false;
+                            turnPerf.commitAt = millis();
+                            Serial.printf("[VOICE] Turn %d: commit (%s, capture=%lums, chunks=%u)\n",
+                                          turnPerf.turnIndex,
+                                          maxDuration ? "max_duration" : "silence",
+                                          voicePerfSince(turnPerf.speechStartAt),
+                                          (unsigned int)turnPerf.sentAudioChunks);
+                            drainSendQueue(audioService);
+                            voiceWsCommitTurn();
+                            state = VoiceState::THINKING;
+                            voiceSetLed(state);
+                        }
+                    }
+
+                } else if (state == VoiceState::SPEAKING && cap->sampleCount > 0) {
+                    float rms = audioCalculateRMS(cap->samples, cap->sampleCount);
+                    if (rms >= BARGE_IN_THRESHOLD) {
+                        bargeInFrames++;
+                        if (bargeInFrames >= BARGE_IN_CONFIRM_FRAMES) {
+                            Serial.printf("[VOICE] Barge-in detected (RMS=%.0f, frames=%d)\n", rms, bargeInFrames);
+                            voiceWsInterrupt();
+                            audioService.ResetPlayback();
+                            audioService.SetGenerationId(audioService.GetGenerationId() + 1);
+                            bargeInFrames = 0;
+
+                            speechDetected = true;
+                            turnCounter++;
+                            resetVoiceTurnPerf(turnPerf);
+                            turnPerf.turnIndex = turnCounter;
+                            turnPerf.speechStartAt = millis();
+                            lastVoiceAt = millis();
+
+                            audioService.PushForEncoding(cap->samples, cap->sampleCount);
+                            turnPerf.sentAudioChunks++;
+                            turnPerf.sentAudioBytes += cap->sampleCount * sizeof(int16_t);
+                            turnPerf.firstChunkSentAt = millis();
+
+                            state = VoiceState::LISTENING;
+                            voiceSetLed(state);
+                        }
+                    } else {
+                        bargeInFrames = 0;
+                    }
+                } else {
+                    bargeInFrames = 0;
+                }
+
+                audioService.ReleaseCaptureChunk(cap);
+            }
+
+            if (checkAiChatShortPress()) {
+                if (state == VoiceState::THINKING || state == VoiceState::SPEAKING) {
+                    Serial.println("[VOICE] Button interrupt");
+                    voiceWsInterrupt();
+                    audioService.ResetPlayback();
+                    audioService.SetGenerationId(audioService.GetGenerationId() + 1);
+                    speechDetected = false;
+                    lastVoiceAt = 0;
+                    bargeInFrames = 0;
+                    resetVoiceTurnPerf(turnPerf);
+                    state = VoiceState::LISTENING;
+                    voiceSetLed(state);
+                }
+            }
+
+            VoiceWsEvent event;
+            while (voiceWsPollEvent(event)) {
+                if (event.type == VoiceWsEventType::AsrPartial) {
+                    if (turnPerf.firstAsrPartialAt == 0) {
+                        turnPerf.firstAsrPartialAt = millis();
+                        Serial.printf("[VOICE] Turn %d: ASR partial (+%lums) \"%s\"\n",
+                                      turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.text.c_str());
+                    }
+                } else if (event.type == VoiceWsEventType::AsrFinal) {
+                    if (state == VoiceState::LISTENING && voiceWsServerVad() && speechDetected) {
+                        speechDetected = false;
+                        turnPerf.commitAt = millis();
+                        state = VoiceState::THINKING;
+                        voiceSetLed(state);
+                        Serial.printf("[VOICE] Turn %d: server_auto_commit \"%s\"\n",
+                                      turnPerf.turnIndex, event.transcript.c_str());
+                    }
+                    turnPerf.asrFinalAt = millis();
+                    Serial.printf("[VOICE] Turn %d: ASR final (+%lums) \"%s\"\n",
+                                  turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.transcript.c_str());
+                } else if (event.type == VoiceWsEventType::LlmDelta) {
+                    if (turnPerf.firstLlmDeltaAt == 0) {
+                        turnPerf.firstLlmDeltaAt = millis();
+                        Serial.printf("[VOICE] Turn %d: first LLM delta (+%lums)\n",
+                                      turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt));
+                    }
+                } else if (event.type == VoiceWsEventType::TtsAudioChunk) {
+                    turnPerf.recvAudioChunks++;
+                    turnPerf.recvAudioBytes += event.dataLen;
+                    if (turnPerf.firstTtsChunkAt == 0) {
+                        turnPerf.firstTtsChunkAt = millis();
+                        Serial.printf("[VOICE] Turn %d: first TTS chunk (+%lums, %u bytes)\n",
+                                      turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), (unsigned int)event.dataLen);
+                    }
+
+                    audioService.SetGenerationId(event.generationId);
+                    if (event.needsDecode) {
+                        audioService.PushForDecoding(event.data, event.dataLen, event.generationId);
+                    } else {
+                        audioService.PushPcmForPlayback(event.data, event.dataLen, event.generationId);
+                    }
+
+                    if (state != VoiceState::SPEAKING) {
+                        turnPerf.firstPlaybackAt = millis();
+                        state = VoiceState::SPEAKING;
+                        voiceSetLed(state);
+                        bargeInFrames = 0;
+                    }
+
+                } else if (event.type == VoiceWsEventType::TurnInterrupted) {
+                    Serial.printf("[VOICE] Turn %d: interrupted by server\n", turnPerf.turnIndex);
+                    audioService.ResetPlayback();
+
+                } else if (event.type == VoiceWsEventType::TurnDone) {
+                    turnPerf.turnDoneAt = millis();
+                    bool exitConversation = event.exitConversation;
+                    Serial.printf("[VOICE] Turn %d: done (total=%lums, commit_to_done=%lums, tts_chunks=%u, exit=%s)\n",
+                                  turnPerf.turnIndex,
+                                  voicePerfSince(turnPerf.speechStartAt),
+                                  voicePerfSince(turnPerf.commitAt),
+                                  (unsigned int)turnPerf.recvAudioChunks,
+                                  exitConversation ? "true" : "false");
+
+                    unsigned long drainStart = millis();
+                    while (!audioService.IsPlaybackEmpty() && millis() - drainStart < 10000UL) {
+                        voiceWsLoop();
+                        delay(20);
+                    }
+                    delay(300);
+                    audioService.ResetPlayback();
+
+                    if (exitConversation) {
+                        Serial.println("[VOICE] Conversation ended by user request");
+                        voiceWsClose();
+                        ledFeedback("success");
+                        audioService.Stop();
+                        return;
+                    }
+
+                    speechDetected = false;
+                    lastVoiceAt = 0;
+                    bargeInFrames = 0;
+                    resetVoiceTurnPerf(turnPerf);
+                    state = VoiceState::LISTENING;
+                    voiceSetLed(state);
+                    audioService.FlushCaptureQueue();
+
+                } else if (event.type == VoiceWsEventType::Error) {
+                    Serial.printf("[VOICE] Server error: %s\n", event.text.c_str());
+                    audioService.ResetPlayback();
+                    speechDetected = false;
+                    lastVoiceAt = 0;
+                    bargeInFrames = 0;
+                    resetVoiceTurnPerf(turnPerf);
+                    state = VoiceState::LISTENING;
+                    voiceSetLed(state);
+                }
+                voiceWsReleaseEvent(event);
+            }
+
+            delay(5);
+        }
+
+        Serial.println("[VOICE] Disconnected, will reconnect in 2s");
+        audioService.ResetPlayback();
+        voiceWsClose();
+        ledFeedback("fail");
+        speechDetected = false;
+        lastVoiceAt = 0;
+        bargeInFrames = 0;
+        delay(2000);
+    }
+}
+
+// ── setup (voice-only) ──────────────────────────────────────
+
+void setup() {
+    Serial.begin(115200);
+    delay(3000);
+    Serial.println("\n=== InkSight Voice ===");
+
+    ledInit();
+    loadConfig();
+
+    bool forcePortal = false;
+    if (digitalRead(PIN_CFG_BTN) == LOW) {
+        delay(400);
+        forcePortal = (digitalRead(PIN_CFG_BTN) == LOW);
+    }
+    bool hasConfig = (cfgSSID.length() > 0);
+
+    if (forcePortal || !hasConfig || cfgServer.length() == 0) {
+        Serial.println(forcePortal ? "[PORTAL] Button held -> portal" : "[PORTAL] No config -> portal");
+        String mac = WiFi.macAddress();
+        String apName = "InkSight-" + mac.substring(mac.length() - 5);
+        apName.replace(":", "");
+        Serial.printf("[PORTAL] AP: %s\n", apName.c_str());
+        ledFeedback("portal");
+        startCaptivePortal();
+        gPortalMode = true;
+        return;
+    }
+
+    ledFeedback("connecting");
+    if (!connectWiFi()) {
+        Serial.println("[VOICE] WiFi failed, restarting in 5s");
+        ledFeedback("fail");
+        delay(5000);
+        ESP.restart();
+    }
+    Serial.println("[VOICE] WiFi connected");
+
+    static Inmp441Max98357Codec codec(true);
+    if (!codec.Start()) {
+        Serial.println("[VOICE] Codec start failed, restarting in 5s");
+        ledFeedback("fail");
+        delay(5000);
+        ESP.restart();
+    }
+
+    static AudioService audioService;
+    if (!audioService.Initialize(&codec)) {
+        Serial.println("[VOICE] AudioService init failed, restarting in 5s");
+        ledFeedback("fail");
+        delay(5000);
+        ESP.restart();
+    }
+
+    ledFeedback("success");
+    runVoiceLoop(audioService);
+}
+
+// ── loop (voice-only) ───────────────────────────────────────
+
+void loop() {
+    if (gPortalMode) {
+        handlePortalClients();
+        if (digitalRead(PIN_CFG_BTN) == LOW) {
+            delay(400);
+            if (digitalRead(PIN_CFG_BTN) == LOW) {
+                unsigned long held = millis();
+                while (digitalRead(PIN_CFG_BTN) == LOW && millis() - held < (unsigned long)CFG_BTN_HOLD_MS) {
+                    delay(10);
+                }
+                if (millis() - held >= (unsigned long)CFG_BTN_HOLD_MS) {
+                    Serial.println("[PORTAL] Long press -> restart");
+                    ledFeedback("ack");
+                    delay(500);
+                    ESP.restart();
+                }
+            }
+        }
+        delay(5);
+        return;
+    }
+    delay(100);
+}
+
+// ═════════════════════════════════════════════════════════════
+#else  // !VOICE_ONLY_BUILD — original display firmware
+// ═════════════════════════════════════════════════════════════
+
+static const char *VOICE_INPUT_FILE = "/voice_input.pcm";
+static const char *VOICE_REPLY_FILE = "/voice_reply.pcm";
+static const int VOICE_RECORD_SECONDS = 10;
+static const int AUTO_BOOT_VOICE_RECORD_SECONDS = 3;
+
+// ── Forward declarations ────────────────────────────────────
+static void checkConfigButton();
+static void checkAiChatButton();
+static void triggerImmediateRefresh(bool nextMode, bool keepWiFi);
+static void handleLiveMode();
+static bool waitForContentReady();
+static void handleFailure(const char *reason);
+static void enterDeepSleep(int minutes);
+static bool runAiChatConversation();
+static bool decodeVoiceBmpToFrameBuffer(const uint8_t *bmpBytes, size_t bmpLen);
+
+// ═════════════════════════════════════════════════════════════
+// setup() — display build
 // ═════════════════════════════════════════════════════════════
 
 void setup() {
@@ -144,6 +643,15 @@ void setup() {
 
     gpioInit();
     ledInit();
+
+    epdInit();
+    cacheInit();
+    Serial.println("EPD ready");
+#if PIN_AI_CHAT_SW >= 0
+    pinMode(PIN_AI_CHAT_SW, INPUT_PULLUP);
+#endif
+
+    loadConfig();
 
     bool forcePortal = false;
     if (digitalRead(PIN_CFG_BTN) == LOW) {
@@ -156,24 +664,29 @@ void setup() {
 
     loadConfig();
 
-    bool hasConfig   = (cfgSSID.length() > 0);
+    bool hasConfig = (cfgSSID.length() > 0);
 
     if (forcePortal || !hasConfig) {
         Serial.println(forcePortal ? "Config button held -> portal"
                                    : "No WiFi config -> portal");
         delay(5000);
         enterPortalMode();
+        String mac = WiFi.macAddress();
+        String apName = "InkSight-" + mac.substring(mac.length() - 5);
+        apName.replace(":", "");
+        ledFeedback("portal");
+        showSetupScreen(apName.c_str());
+        startCaptivePortal();
+        ctx.state = DeviceState::PORTAL;
         return;
     }
 
-    // Check server URL is configured
     if (cfgServer.length() == 0) {
         Serial.println("No server URL configured -> portal");
         enterPortalMode();
         return;
     }
 
-    // Normal boot: connect WiFi and fetch image
     int retryCount = getRetryCount();
     Serial.printf("Retry count: %d/%d\n", retryCount, MAX_RETRY_COUNT);
 
@@ -189,26 +702,36 @@ void setup() {
         return;
     }
 
-    // Best-effort fetch config flags from backend
     bool focusFlag = false;
-    bool alwaysActiveFlag = false;
-    if (fetchConfigFlags(&focusFlag, &alwaysActiveFlag)) {
+    if (fetchFocusListeningFlag(&focusFlag)) {
         focusListening = focusFlag;
-        alwaysActive = alwaysActiveFlag;
     } else {
         focusListening = false;
-        alwaysActive = false;
     }
     if (g_userAborted) {
-        Serial.println("User aborted during config flag fetch -> portal");
+        Serial.println("User aborted during focus fetch -> portal");
         enterPortalMode();
         return;
     }
 
+#if AUTO_BOOT_AI_CHAT && defined(BOARD_PROFILE_ESP32_WROOM32E)
+    Serial.println("[AI CHAT] Auto boot enabled, entering conversation mode");
+    ledFeedback("ack");
+    g_userAborted = false;
+    bool autoExited = runAiChatConversation();
+    Serial.printf("[AI CHAT] Auto boot conversation finished, exited=%s\n", autoExited ? "true" : "false");
+    if (g_userAborted) {
+        Serial.println("User aborted AI chat -> portal");
+        enterPortalMode();
+        return;
+    }
+#endif
+
     Serial.println("Fetching image...");
     ledFeedback("downloading");
     bool gotFallback = false;
-    bool ok = fetchBMP(false, &gotFallback);
+    String renderedModeId;
+    bool ok = fetchBMP(false, &gotFallback, &renderedModeId);
     if (g_userAborted) {
         Serial.println("User aborted during fetch -> portal");
         enterPortalMode();
@@ -222,7 +745,6 @@ void setup() {
         }
     }
 
-    // Success - reset retry counter
     resetRetryCount();
 
     cacheSave(imgBuf, IMG_BUF_LEN);
@@ -235,20 +757,37 @@ void setup() {
     lastRenderedPeriod = currentPeriodIndex();
     ctx.lastClockTick = millis();
 
+    bool aiChatRequested = renderedModeId.equalsIgnoreCase(AI_CHAT_MODE_ID);
+    if (aiChatRequested) {
+        g_userAborted = false;
+        bool exited = runAiChatConversation();
+        if (g_userAborted) {
+            Serial.println("User aborted AI chat -> portal");
+            enterPortalMode();
+            return;
+        }
+        if (exited) {
+            ledFeedback("downloading");
+            if (fetchBMP(true, nullptr, nullptr)) {
+                cacheSave(imgBuf, IMG_BUF_LEN);
+                lastContentChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
+                syncNTP();
+                smartDisplay(imgBuf);
+                ledFeedback("success");
+                lastRenderedPeriod = currentPeriodIndex();
+                ctx.lastClockTick = millis();
+            }
+        }
+    }
+
     bool firstInstallLivePending = isFirstInstallLiveModePending();
-    if (firstInstallLivePending || alwaysActive) {
+    if (firstInstallLivePending) {
         ctx.liveMode = true;
         ctx.lastLivePollAt = 0;
         ctx.lastLiveWiFiRetryAt = 0;
-        if (firstInstallLivePending) {
-            markFirstInstallLiveModeDone();
-        }
+        markFirstInstallLiveModeDone();
         postRuntimeMode("active");
-        if (alwaysActive) {
-            Serial.println("[LIVE] Always-active enabled");
-        } else {
-            Serial.println("[LIVE] First install: default to active mode");
-        }
+        Serial.println("[LIVE] First install: default to active mode");
     } else {
         postRuntimeMode("interval");
         if (focusListening) {
@@ -270,28 +809,24 @@ void setup() {
 }
 
 // ═════════════════════════════════════════════════════════════
-// loop()
+// loop() — display build
 // ═════════════════════════════════════════════════════════════
 
 void loop() {
-    // Portal mode: only handle web requests
     if (ctx.state == DeviceState::PORTAL) {
         handlePortalClients();
         checkConfigButton();
+        checkAiChatButton();
         delay(5);
         return;
     }
 
     checkConfigButton();
+    checkAiChatButton();
 
     if (ctx.wantEnterLiveMode) {
         ctx.wantEnterLiveMode = false;
         if (ctx.liveMode) {
-            if (alwaysActive) {
-                Serial.println("[LIVE] Always-active enabled, ignoring manual disable");
-                ledFeedback("ack");
-                return;
-            }
             ctx.liveMode = false;
             Serial.println("[LIVE] Live mode disabled, back to interval mode");
             ledFeedback("ack");
@@ -309,6 +844,25 @@ void loop() {
                 postRuntimeMode("active");
             }
         }
+    } else if (ctx.wantEnterAiChatMode) {
+        ctx.wantEnterAiChatMode = false;
+        Serial.println("[AI CHAT] Dedicated switch long press -> enter conversation mode");
+        ledFeedback("ack");
+        if (WiFi.status() != WL_CONNECTED && !connectWiFi()) {
+            Serial.println("[AI CHAT] WiFi reconnect failed, skip this request");
+        } else {
+            g_userAborted = false;
+            bool exited = runAiChatConversation();
+            Serial.printf("[AI CHAT] Manual conversation finished, exited=%s\n", exited ? "true" : "false");
+            if (g_userAborted) {
+                Serial.println("User aborted AI chat -> portal");
+                enterPortalMode();
+                return;
+            }
+            if (exited) {
+                ctx.wantRefresh = true;
+            }
+        }
     } else if (ctx.wantRefresh) {
         triggerImmediateRefresh();
         ctx.wantRefresh = false;
@@ -324,7 +878,7 @@ void loop() {
         ctx.lastClockTick += 1000UL;
         timeChanged = true;
     }
-    if (timeChanged && cfgSleepMin > 180 && !focusListening && !alwaysActive) {
+    if (timeChanged && cfgSleepMin > 180 && !focusListening) {
         int currentPeriod = currentPeriodIndex();
         if (currentPeriod != lastRenderedPeriod) {
             updateTimeDisplay();
@@ -354,7 +908,6 @@ void loop() {
         postHeartbeat();
     }
 
-    // Focus Mode: 10s poll alert-bmp and show full-screen alert for 30s
     static unsigned long lastAlertPollAt = 0;
     static bool alertVisible = false;
     static unsigned long alertShownAt = 0;
@@ -394,11 +947,11 @@ void loop() {
     delay(50);
 }
 
-// ── Deep sleep helper ───────────────────────────────────────
+// ── Deep sleep ──────────────────────────────────────────────
 
 static void enterDeepSleep(int minutes) {
-    if (focusListening || alwaysActive) {
-        Serial.println("[LIVE] Active keep-awake enabled, skipping deep sleep");
+    if (focusListening) {
+        Serial.println("[FOCUS] Focus listening enabled, skipping deep sleep");
         return;
     }
     epdSleep();
@@ -408,7 +961,7 @@ static void enterDeepSleep(int minutes) {
     esp_deep_sleep_start();
 }
 
-// ── Failure handler with retry logic ────────────────────────
+// ── Failure handler ─────────────────────────────────────────
 
 static void showFailureDiagnostic(const char *reason) {
     char l2[64], l3[64];
@@ -418,15 +971,11 @@ static void showFailureDiagnostic(const char *reason) {
 }
 
 static void handleFailure(const char *reason) {
-    // Show diagnostic screen so user can see what's wrong
     Serial.printf("[DIAG] %s | SSID=%s | Server=%s\n",
                   reason, cfgSSID.c_str(), cfgServer.c_str());
     showFailureDiagnostic(reason);
-
-    // Wait 5 seconds so user can read the diagnostic
     delay(5000);
 
-    // Try offline cache
     if (cacheLoad(imgBuf, IMG_BUF_LEN)) {
         Serial.println("Showing cached content (offline mode)");
         const int offlineScale = 2;
@@ -449,13 +998,10 @@ static void handleFailure(const char *reason) {
         return;
     }
 
-    // No cache — retry logic
     int retryCount = getRetryCount();
-
     if (retryCount < MAX_RETRY_COUNT) {
         int delaySec = RETRY_DELAYS[retryCount];
         setRetryCount(retryCount + 1);
-
         Serial.printf("%s, retry %d/%d in %ds...\n",
                       reason, retryCount + 1, MAX_RETRY_COUNT, delaySec);
         delay((unsigned long)delaySec * 1000);
@@ -463,8 +1009,8 @@ static void handleFailure(const char *reason) {
     } else {
         Serial.println("Max retries reached, entering deep sleep");
         resetRetryCount();
-        if (focusListening || alwaysActive) {
-            Serial.println("[LIVE] Active keep-awake enabled, not entering deep sleep");
+        if (focusListening) {
+            Serial.println("[FOCUS] Focus listening enabled, not entering deep sleep");
             ctx.state = DeviceState::DISPLAYING;
             ctx.setupDoneAt = millis();
             return;
@@ -474,7 +1020,7 @@ static void handleFailure(const char *reason) {
     }
 }
 
-// ── Immediate refresh (reused by button press and timer) ────
+// ── Live mode ───────────────────────────────────────────────
 
 static void handleLiveMode() {
     if (!ctx.liveMode) return;
@@ -505,22 +1051,13 @@ static void handleLiveMode() {
     ctx.lastLivePollAt = now;
 
     bool shouldExitLive = false;
-    bool hasPendingOTA = hasPendingRemoteAction(&shouldExitLive);
-    if (hasPendingOTA) {
-        // Check if it's an OTA action (g_pending_ota_url is set)
-        if (g_pending_ota_url.length() > 0) {
-            Serial.println("[LIVE] Pending OTA detected, initiating firmware update...");
-            checkAndPerformOTA();
-            // On success the task reboots; on failure it clears g_pending_ota_url
-            // and deletes itself. Either way we must NOT touch the globals here.
-            return;
-        }
+    if (hasPendingRemoteAction(&shouldExitLive)) {
         Serial.println("[LIVE] Pending action detected, refreshing now");
         triggerImmediateRefresh(false, true);
         ctx.setupDoneAt = millis();
         return;
     }
-    if (shouldExitLive && !alwaysActive) {
+    if (shouldExitLive) {
         ctx.liveMode = false;
         postRuntimeMode("interval");
         WiFi.disconnect(true);
@@ -540,6 +1077,324 @@ static void handleLiveMode() {
     }
 }
 
+// ── BMP decode helper ───────────────────────────────────────
+
+static bool decodeVoiceBmpToFrameBuffer(const uint8_t *bmpBytes, size_t bmpLen) {
+    if (bmpBytes == nullptr || bmpLen < 14) return false;
+    uint32_t pixelOffset = bmpBytes[10]
+                         | ((uint32_t)bmpBytes[11] << 8)
+                         | ((uint32_t)bmpBytes[12] << 16)
+                         | ((uint32_t)bmpBytes[13] << 24);
+    if (pixelOffset >= bmpLen) return false;
+    const uint8_t *pixelData = bmpBytes + pixelOffset;
+    size_t requiredBytes = (size_t)ROW_STRIDE * H;
+    if ((size_t)(bmpLen - pixelOffset) < requiredBytes) return false;
+    for (int bmpY = 0; bmpY < H; bmpY++) {
+        int dispY = H - 1 - bmpY;
+        memcpy(imgBuf + dispY * ROW_BYTES, pixelData + (size_t)bmpY * ROW_STRIDE, ROW_BYTES);
+    }
+    return true;
+}
+
+// ── AI Chat conversation (display build, full-duplex) ───────
+
+static bool runAiChatConversation() {
+#if !defined(BOARD_PROFILE_ESP32_WROOM32E)
+    showAiChatStatus("AI CHAT", "unsupported on this board");
+    return false;
+#else
+    // Keep large audio objects off the function stack. The voice-only build
+    // already uses static lifetime here and is stable on WROOM32E.
+    static Inmp441Max98357Codec codec(true);
+    if (!codec.Start()) {
+        showAiChatStatus("AUDIO FAIL", "");
+        return false;
+    }
+
+    static AudioService audioService;
+    Serial.println("[AI CHAT] Audio codec started, initializing AudioService");
+    if (!audioService.Initialize(&codec)) {
+        showAiChatStatus("QUEUE FAIL", "");
+        codec.Stop();
+        return false;
+    }
+
+    bool sessionReady = false;
+    bool waitingForTurnDone = false;
+    bool speechDetected = false;
+    bool exitConversation = false;
+    unsigned long lastVoiceAt = 0;
+    unsigned long wsOpenStartedAt = millis();
+    int turnCounter = 0;
+    VoiceTurnPerf turnPerf;
+    unsigned long lastRmsLogAt = 0;
+    float peakRms = 0;
+
+    if (!voiceWsOpen(SAMPLE_RATE, W, H, true)) {
+        showAiChatStatus("WS FAIL", "");
+        codec.Stop();
+        return false;
+    }
+    Serial.printf("[VOICE_PERF][DEVICE] ws_open_ms=%lu\n", millis() - wsOpenStartedAt);
+
+    unsigned long readyStartAt = millis();
+    while (!sessionReady && millis() - readyStartAt < 6000UL) {
+        voiceWsLoop();
+        VoiceWsEvent readyEvent;
+        while (voiceWsPollEvent(readyEvent)) {
+            if (readyEvent.type == VoiceWsEventType::SessionReady) {
+                sessionReady = true;
+            } else if (readyEvent.type == VoiceWsEventType::Error) {
+                showAiChatStatus("WS ERROR", readyEvent.text.c_str());
+            }
+            voiceWsReleaseEvent(readyEvent);
+        }
+        delay(10);
+    }
+    if (!sessionReady) {
+        voiceWsClose();
+        codec.Stop();
+        showAiChatStatus("WS READY", "timeout");
+        return false;
+    }
+    Serial.printf("[VOICE_PERF][DEVICE] session_ready_wait_ms=%lu total_ready_ms=%lu\n", millis() - readyStartAt, millis() - wsOpenStartedAt);
+
+    if (fetchVoiceIntroImage(W, H)) {
+        epdDisplay(imgBuf);
+    } else {
+        showAiChatStatus("AI CHAT", "please talk to me");
+    }
+    audioService.Start();
+    audioService.FlushCaptureQueue();
+
+    while (voiceWsConnected()) {
+        voiceWsLoop();
+        drainSendQueue(audioService);
+
+        AsCaptureChunk *captureChunk = nullptr;
+        while (audioService.PollCaptureChunk(captureChunk)) {
+            if (!waitingForTurnDone && captureChunk->sampleCount > 0) {
+                audioNoiseGateApply(captureChunk->samples, captureChunk->sampleCount, 80.0f);
+                float rms = audioCalculateRMS(captureChunk->samples, captureChunk->sampleCount);
+                if (!speechDetected && rms < VOICE_STREAM_VAD_THRESHOLD) {
+                    audioAdaptiveNoiseFloor(rms);
+                }
+                float noiseFloor = audioAdaptiveNoiseFloor(-1.0f);
+                float effectiveThreshold = max(VOICE_STREAM_VAD_THRESHOLD, noiseFloor * 3.0f);
+
+                if (rms > peakRms) peakRms = rms;
+                if (millis() - lastRmsLogAt >= 2000) {
+                    Serial.printf("[VOICE_PERF][DEVICE] MIC peak RMS=%.0f threshold=%.0f noise=%.0f\n",
+                                  peakRms, effectiveThreshold, noiseFloor);
+                    peakRms = 0;
+                    lastRmsLogAt = millis();
+                }
+
+                if (rms >= effectiveThreshold) {
+                    if (!speechDetected) {
+                        turnCounter++;
+                        resetVoiceTurnPerf(turnPerf);
+                        turnPerf.turnIndex = turnCounter;
+                        turnPerf.speechStartAt = millis();
+                        Serial.printf("[VOICE_PERF][DEVICE] turn=%d speech_start rms=%.0f threshold=%.0f\n",
+                                      turnPerf.turnIndex, rms, effectiveThreshold);
+                    }
+                    speechDetected = true;
+                    lastVoiceAt = millis();
+                }
+                if (speechDetected) {
+                    audioService.PushForEncoding(captureChunk->samples, captureChunk->sampleCount);
+                    turnPerf.sentAudioChunks++;
+                    turnPerf.sentAudioBytes += captureChunk->sampleCount * sizeof(int16_t);
+                    if (turnPerf.firstChunkSentAt == 0) {
+                        turnPerf.firstChunkSentAt = millis();
+                        Serial.printf(
+                            "[VOICE_PERF][DEVICE] turn=%d first_audio_chunk_sent_ms=%lu bytes=%u\n",
+                            turnPerf.turnIndex,
+                            voicePerfSince(turnPerf.speechStartAt),
+                            (unsigned int)(captureChunk->sampleCount * sizeof(int16_t))
+                        );
+                    }
+                }
+
+                bool silenceTimeout = !voiceWsServerVad() && speechDetected && (millis() - lastVoiceAt >= (unsigned long)VOICE_SILENCE_COMMIT_MS);
+                bool maxDurationReached = speechDetected && (millis() - turnPerf.speechStartAt >= VOICE_MAX_CAPTURE_MS);
+
+                if (silenceTimeout || maxDurationReached) {
+                    waitingForTurnDone = true;
+                    speechDetected = false;
+                    turnPerf.commitAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d commit_sent capture_ms=%lu sent_chunks=%u sent_bytes=%u reason=%s\n",
+                        turnPerf.turnIndex,
+                        voicePerfSince(turnPerf.speechStartAt),
+                        (unsigned int)turnPerf.sentAudioChunks,
+                        (unsigned int)turnPerf.sentAudioBytes,
+                        maxDurationReached ? "max_duration" : "silence"
+                    );
+                    drainSendQueue(audioService);
+                    if (!voiceWsCommitTurn()) {
+                        audioService.Stop();
+                        voiceWsClose();
+                        codec.Stop();
+                        updateAiChatConversationText("ERROR", "send commit request failed");
+                        return false;
+                    }
+                }
+            }
+            audioService.ReleaseCaptureChunk(captureChunk);
+        }
+
+        if (waitingForTurnDone && checkAiChatShortPress()) {
+            voiceWsInterrupt();
+            waitingForTurnDone = false;
+            speechDetected = false;
+            lastVoiceAt = 0;
+            if (turnPerf.turnIndex > 0) {
+                Serial.printf("[VOICE_PERF][DEVICE] turn=%d interrupted_after_commit_ms=%lu\n", turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt));
+            }
+            audioService.ResetPlayback();
+            audioService.SetGenerationId(audioService.GetGenerationId() + 1);
+            resetVoiceTurnPerf(turnPerf);
+        }
+
+        VoiceWsEvent event;
+        while (voiceWsPollEvent(event)) {
+            if (event.type == VoiceWsEventType::AsrPartial) {
+                if (turnPerf.firstAsrPartialAt == 0) {
+                    turnPerf.firstAsrPartialAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d first_asr_partial_after_commit_ms=%lu text=%s\n",
+                        turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.text.c_str()
+                    );
+                }
+            } else if (event.type == VoiceWsEventType::AsrFinal) {
+                if (!waitingForTurnDone && voiceWsServerVad()) {
+                    waitingForTurnDone = true;
+                    speechDetected = false;
+                    if (turnPerf.commitAt == 0) turnPerf.commitAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d server_auto_commit transcript=%s\n",
+                        turnPerf.turnIndex, event.transcript.c_str()
+                    );
+                }
+                if (turnPerf.asrFinalAt == 0) {
+                    turnPerf.asrFinalAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d asr_final_after_commit_ms=%lu transcript=%s\n",
+                        turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.transcript.c_str()
+                    );
+                }
+            } else if (event.type == VoiceWsEventType::LlmDelta) {
+                if (turnPerf.firstLlmDeltaAt == 0) {
+                    turnPerf.firstLlmDeltaAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d first_llm_delta_after_commit_ms=%lu text=%s\n",
+                        turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.text.c_str()
+                    );
+                }
+            } else if (event.type == VoiceWsEventType::TtsAudioChunk) {
+                turnPerf.recvAudioChunks++;
+                turnPerf.recvAudioBytes += event.dataLen;
+                if (turnPerf.firstTtsChunkAt == 0) {
+                    turnPerf.firstTtsChunkAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d first_tts_chunk_after_commit_ms=%lu bytes=%u\n",
+                        turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), (unsigned int)event.dataLen
+                    );
+                }
+                audioService.SetGenerationId(event.generationId);
+                if (event.needsDecode) {
+                    audioService.PushForDecoding(event.data, event.dataLen, event.generationId);
+                } else {
+                    audioService.PushPcmForPlayback(event.data, event.dataLen, event.generationId);
+                }
+                if (turnPerf.firstPlaybackAt == 0) {
+                    turnPerf.firstPlaybackAt = millis();
+                    Serial.printf(
+                        "[VOICE_PERF][DEVICE] turn=%d playback_started_after_commit_ms=%lu\n",
+                        turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt)
+                    );
+                }
+            } else if (event.type == VoiceWsEventType::TurnInterrupted) {
+                if (turnPerf.turnIndex > 0) {
+                    Serial.printf("[VOICE_PERF][DEVICE] turn=%d turn_interrupted_after_commit_ms=%lu\n", turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt));
+                }
+                audioService.ResetPlayback();
+            } else if (event.type == VoiceWsEventType::TurnDone) {
+                waitingForTurnDone = false;
+                speechDetected = false;
+                lastVoiceAt = 0;
+                exitConversation = event.exitConversation;
+                turnPerf.turnDoneAt = millis();
+                unsigned long imageStartedAt = millis();
+                bool imageUpdated = false;
+                if (event.data != nullptr && event.dataLen > 0 && decodeVoiceBmpToFrameBuffer(event.data, event.dataLen)) {
+                    imageUpdated = true;
+                } else if (event.turnId.length() > 0 && fetchVoiceImage(event.turnId)) {
+                    imageUpdated = true;
+                }
+                unsigned long imageMs = millis() - imageStartedAt;
+                unsigned long drainStartedAt = millis();
+                while (!audioService.IsPlaybackEmpty() && millis() - drainStartedAt < 10000UL) {
+                    voiceWsLoop();
+                    delay(20);
+                }
+                unsigned long drainMs = millis() - drainStartedAt;
+                delay(120);
+                audioService.ResetPlayback();
+                unsigned long displayStartedAt = millis();
+                if (imageUpdated) {
+                    refreshAiChatConversationBody();
+                }
+                unsigned long displayMs = millis() - displayStartedAt;
+                Serial.printf(
+                    "[VOICE_PERF][DEVICE] turn=%d done total_ms=%lu commit_to_done_ms=%lu commit_to_asr_final_ms=%lu commit_to_first_llm_ms=%lu commit_to_first_tts_chunk_ms=%lu commit_to_playback_ms=%lu recv_audio_chunks=%u recv_audio_bytes=%u image_ms=%lu display_ms=%lu drain_ms=%lu exit=%s\n",
+                    turnPerf.turnIndex,
+                    voicePerfSince(turnPerf.speechStartAt),
+                    voicePerfSince(turnPerf.commitAt),
+                    turnPerf.asrFinalAt > 0 ? (turnPerf.asrFinalAt - turnPerf.commitAt) : 0,
+                    turnPerf.firstLlmDeltaAt > 0 ? (turnPerf.firstLlmDeltaAt - turnPerf.commitAt) : 0,
+                    turnPerf.firstTtsChunkAt > 0 ? (turnPerf.firstTtsChunkAt - turnPerf.commitAt) : 0,
+                    turnPerf.firstPlaybackAt > 0 ? (turnPerf.firstPlaybackAt - turnPerf.commitAt) : 0,
+                    (unsigned int)turnPerf.recvAudioChunks,
+                    (unsigned int)turnPerf.recvAudioBytes,
+                    imageMs, displayMs, drainMs,
+                    exitConversation ? "true" : "false"
+                );
+                if (exitConversation) {
+                    audioService.Stop();
+                    voiceWsClose();
+                    codec.Stop();
+                    return true;
+                }
+                resetVoiceTurnPerf(turnPerf);
+            } else if (event.type == VoiceWsEventType::Error) {
+                if (turnPerf.turnIndex > 0) {
+                    Serial.printf("[VOICE_PERF][DEVICE] turn=%d error_after_commit_ms=%lu message=%s\n", turnPerf.turnIndex, voicePerfSince(turnPerf.commitAt), event.text.c_str());
+                }
+                updateAiChatConversationText("ERROR", event.text.c_str());
+                waitingForTurnDone = false;
+                speechDetected = false;
+                lastVoiceAt = 0;
+                audioService.ResetPlayback();
+                resetVoiceTurnPerf(turnPerf);
+            }
+            voiceWsReleaseEvent(event);
+        }
+
+        delay(10);
+    }
+
+    audioService.Stop();
+    voiceWsClose();
+    codec.Stop();
+    return false;
+#endif
+}
+
+// ── Immediate refresh ───────────────────────────────────────
+
 static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
     Serial.println("[REFRESH] Triggering immediate refresh...");
     ledFeedback("ack");
@@ -553,26 +1408,19 @@ static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
     }
     if (connected) {
         ledFeedback("downloading");
-        bool forceRefresh = false;
-        if (fetchBMP(nextMode, nullptr, &forceRefresh)) {
-            bool hasRaw2bpp = false;
-#if EPD_BPP >= 2
-            hasRaw2bpp = useColorBuf;
-#endif
-            if (!hasRaw2bpp) {
-                cacheSave(imgBuf, IMG_BUF_LEN);
-            }
-
-            uint32_t newChecksum = 0;
-#if EPD_BPP >= 2
-            newChecksum = hasRaw2bpp
-                ? computeChecksum(colorBuf, COLOR_BUF_LEN)
-                : computeChecksum(imgBuf, IMG_BUF_LEN);
-#else
-            newChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
-#endif
+        String renderedModeId;
+        bool fetched = fetchBMP(nextMode, nullptr, &renderedModeId);
+        bool aiChatRequested = renderedModeId.equalsIgnoreCase(AI_CHAT_MODE_ID);
+        String pendingMode;
+        if (!aiChatRequested) {
+            aiChatRequested = peekPendingMode(pendingMode) && pendingMode.equalsIgnoreCase(AI_CHAT_MODE_ID);
+        }
+        bool keepWiFiEffective = keepWiFi || aiChatRequested;
+        if (fetched) {
+            cacheSave(imgBuf, IMG_BUF_LEN);
+            uint32_t newChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
             syncNTP();
-            if (newChecksum == lastContentChecksum && !nextMode && !forceRefresh) {
+            if (newChecksum == lastContentChecksum && !nextMode) {
                 Serial.println("Content unchanged, skipping display refresh");
                 ledFeedback("success");
             } else {
@@ -583,13 +1431,36 @@ static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
                 Serial.println("Display done");
             }
 
+            if (aiChatRequested) {
+                ledFeedback("ack");
+                g_userAborted = false;
+                bool exited = runAiChatConversation();
+                if (g_userAborted) {
+                    Serial.println("User aborted AI chat -> portal");
+                    enterPortalMode();
+                    return;
+                }
+                if (exited) {
+                    Serial.println("AI chat exited, showing next mode...");
+                    ledFeedback("downloading");
+                    if (fetchBMP(true, nullptr, nullptr)) {
+                        cacheSave(imgBuf, IMG_BUF_LEN);
+                        uint32_t newChecksum2 = computeChecksum(imgBuf, IMG_BUF_LEN);
+                        syncNTP();
+                        smartDisplay(imgBuf);
+                        lastContentChecksum = newChecksum2;
+                        ledFeedback("success");
+                    }
+                }
+            }
+
             lastRenderedPeriod = currentPeriodIndex();
             ctx.lastClockTick = millis();
         } else {
             ledFeedback("fail");
             Serial.println("Fetch failed, keeping old content");
         }
-        if (!keepWiFi) {
+        if (!keepWiFiEffective) {
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
         }
@@ -641,8 +1512,6 @@ static bool waitForContentReady() {
 }
 
 // ── Config button handler ───────────────────────────────────
-// Single click:       toggle live mode / interval mode
-// Long press (>=2s):  restart into config portal
 
 static void checkConfigButton() {
     bool isPressed = (digitalRead(PIN_CFG_BTN) == LOW);
@@ -678,3 +1547,25 @@ static void checkConfigButton() {
         }
     }
 }
+
+static void checkAiChatButton() {
+#if PIN_AI_CHAT_SW < 0
+    return;
+#else
+    bool isPressed = (digitalRead(PIN_AI_CHAT_SW) == LOW);
+    if (isPressed) {
+        if (ctx.aiBtnPressStart == 0) {
+            ctx.aiBtnPressStart = millis();
+        } else if (!ctx.wantEnterAiChatMode &&
+                   (millis() - ctx.aiBtnPressStart >= (unsigned long)AI_CHAT_BTN_HOLD_MS)) {
+            Serial.printf("[AI CHAT] Switch held for %dms, queue enter ai chat\n", AI_CHAT_BTN_HOLD_MS);
+            ctx.wantEnterAiChatMode = true;
+            ctx.aiBtnPressStart = millis();
+        }
+    } else {
+        ctx.aiBtnPressStart = 0;
+    }
+#endif
+}
+
+#endif // VOICE_ONLY_BUILD

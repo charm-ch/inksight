@@ -18,6 +18,11 @@ void showError(const char *msg);
 // Show diagnostic screen with up to 4 lines
 void showDiagnostic(const char *line1, const char *line2, const char *line3, const char *line4);
 
+// Dedicated status screen for local AI chat flow
+void showAiChatStatus(const char *state, const char *detail);
+void updateAiChatConversationText(const char *label, const char *detail);
+void refreshAiChatConversationBody();
+
 int currentPeriodIndex();
 
 void updateTimeDisplay();
@@ -27,11 +32,5 @@ void smartDisplay(const uint8_t *image);
 
 // Show mode name preview screen (displayed briefly on double-click before loading)
 void showModePreview(const char *modeName);
-
-// ── LED feedback patterns ──────────────────────────────────────
-
-// Drive the LED with named feedback patterns.
-// Patterns: "ack", "connecting", "downloading", "success", "fail", "favorite", "portal", "off"
-void ledFeedback(const char *pattern);
 
 #endif // INKSIGHT_DISPLAY_H

@@ -12,6 +12,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+// ── Forward declarations for static functions in other modules ─
+bool beginHttpForUrl(HTTPClient &http, WiFiClient &plainClient, WiFiClientSecure &secClient, const String &url);
+void ledFeedback(const char *pattern);
+
 // ── Global parameters set by network.cpp ───────────────────
 String g_pending_ota_url = "";
 String g_pending_ota_version = "";
